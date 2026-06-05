@@ -1,7 +1,105 @@
+import logging
+import json
+from datetime import datetime
+from pythonjsonlogger import jsonlogger
+import time
+from functools import wraps
 from flask import Flask, request, jsonify
 import requests
 import json
+# ========= ЭТАП 9.3: RETRY + CIRCUIT BREAKER =========
+import time
+import logging
+from functools import wraps
 
+# Настройка простого лога (чтобы видеть, что происходит)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------- 1. RETRY (повторяем запрос, если упал) ----------
+def retry(max_attempts=3, delay=1):
+    """
+    Декоратор: повторяет функцию до 3 раз, если она выкинула ошибку.
+    delay=1 → ждём 1 секунду, потом 2 секунды, потом 4 (экспоненциальная задержка)
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    logger.info(f"Попытка {attempt+1}/{max_attempts} вызвать {func.__name__}")
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    logger.warning(f"Ошибка: {e}. Попытка {attempt+1} не удалась")
+                    if attempt == max_attempts - 1:
+                        raise  # последняя попытка не удалась — кидаем ошибку дальше
+                    wait = delay * (2 ** attempt)  # 1, 2, 4 секунды
+                    logger.info(f"Ждём {wait} секунд перед повторной попыткой...")
+                    time.sleep(wait)
+            return None
+        return wrapper
+    return decorator
+
+# ---------- 2. CIRCUIT BREAKER (защита от мёртвого сервиса) ----------
+class CircuitBreaker:
+    """
+    Простой Circuit Breaker:
+    - CLOSED: всё работает, запросы идут
+    - OPEN: сервис сломался, быстро возвращаем ошибку (не тратим время)
+    - HALF_OPEN: пробуем один запрос, если ок — закрываем
+    """
+    def __init__(self, failure_threshold=3, timeout=30):
+        self.failure_threshold = failure_threshold   # сколько ошибок нужно, чтобы открыть цепь
+        self.timeout = timeout                       # через сколько секунд попробовать снова
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+
+    def call(self, func, *args, **kwargs):
+        # Если цепь открыта
+        if self.state == "OPEN":
+            elapsed = time.time() - self.last_failure_time
+            if elapsed > self.timeout:
+                logger.info("Circuit Breaker: переходим в HALF_OPEN (пробуем один запрос)")
+                self.state = "HALF_OPEN"
+            else:
+                logger.warning(f"Circuit Breaker OPEN, отклоняем запрос (осталось ждать {self.timeout - elapsed:.0f} сек)")
+                raise Exception("Circuit Breaker OPEN — сервис временно недоступен")
+
+        try:
+            result = func(*args, **kwargs)
+            # Если HALF_OPEN и запрос прошёл — закрываем цепь
+            if self.state == "HALF_OPEN":
+                logger.info("Circuit Breaker: запрос в HALF_OPEN успешен, закрываем цепь")
+                self.state = "CLOSED"
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            logger.error(f"Ошибка: {e}. Счётчик ошибок: {self.failure_count}/{self.failure_threshold}")
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+                logger.error("Circuit Breaker: переходим в OPEN (сервис отключён на время)")
+            raise e
+
+# Создаём экземпляр Circuit Breaker для Payment API
+payment_circuit_breaker = CircuitBreaker(failure_threshold=2, timeout=15)
+# ========= НАСТРОЙКА ЛОГИРОВАНИЯ =========
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    fmt='%(asctime)s %(levelname)s %(name)s %(message)s',
+    rename_fields={"levelname": "severity", "asctime": "timestamp"}
+)
+logHandler.setFormatter(formatter)
+logger = logging.getLogger("tourist_aggregator")
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Также пишем в файл
+fileHandler = logging.FileHandler("logs/integration.log")
+fileHandler.setFormatter(formatter)
+logger.addHandler(fileHandler)
 app = Flask(__name__)
 
 # Адреса сервисов (имена контейнеров из docker-compose)
@@ -197,13 +295,22 @@ def safe_book_with_saga():
         booking_id = booking['id']
         orders_db[order_id]["booking_id"] = booking_id
 
-        # --- Шаг B: Проводим оплату ---
-        payment_resp = requests.post(
-            f"{PAYMENT_URL}/pay",
-            json={"booking_id": booking_id, "amount": amount},
-            timeout=5
-        )
-        if payment_resp.status_code != 200:
+                # --- Шаг B: Проводим оплату (с Retry + Circuit Breaker) ---
+        @retry(max_attempts=3, delay=1)  # повторяем 3 раза, если упало
+        def call_payment():
+            return requests.post(
+                f"{PAYMENT_URL}/pay",
+                json={"booking_id": booking_id, "amount": amount},
+                timeout=5
+            )
+
+        try:
+            payment_resp = payment_circuit_breaker.call(call_payment)
+            if payment_resp.status_code != 200:
+                raise Exception(f"Payment вернул ошибку {payment_resp.status_code}")
+            payment = payment_resp.json()
+        except Exception as e:
+            logger.error(f"Оплата не удалась после повторов: {e}")
             raise Exception("Payment failed")
 
         # --- Всё успешно: обновляем статус заказа ---
