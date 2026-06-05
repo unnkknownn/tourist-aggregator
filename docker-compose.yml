@@ -1,10 +1,34 @@
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: tourist-postgres
+    environment:
+      POSTGRES_USER: tourist
+      POSTGRES_PASSWORD: tourist123
+      POSTGRES_DB: tourist_aggregator
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - tourist-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tourist"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   catalog-service:
     build: ./catalog-service
     ports:
       - "5001:5001"
     networks:
       - tourist-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://tourist:tourist123@postgres:5432/tourist_aggregator
 
   booking-service:
     build: ./booking-service
@@ -12,6 +36,11 @@ services:
       - "5002:5002"
     networks:
       - tourist-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://tourist:tourist123@postgres:5432/tourist_aggregator
 
   payment-service:
     build: ./payment-service
@@ -19,8 +48,12 @@ services:
       - "5003:5003"
     networks:
       - tourist-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://tourist:tourist123@postgres:5432/tourist_aggregator
 
- # НОВЫЙ СЕРВИС - ОРКЕСТРАТОР
   integration-service:
     build: ./integration-service
     ports:
@@ -31,9 +64,12 @@ services:
       - catalog-service
       - booking-service
       - payment-service
+    environment:
+      DATABASE_URL: postgresql://tourist:tourist123@postgres:5432/tourist_aggregator
+
+volumes:
+  postgres_data:
 
 networks:
   tourist-net:
     driver: bridge
-
-    
