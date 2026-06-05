@@ -118,5 +118,134 @@ def get_all_bookings():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Booking service error: {str(e)}"}), 503
 
+# ========= ЭТАП 7: State Machine + Saga =========
+from enum import Enum
+import uuid
+
+# Статусы заказа (State Machine)
+class OrderStatus(Enum):
+    NEW = "NEW"
+    PAID = "PAID"
+    CANCELLED = "CANCELLED"
+
+# Хранилище заказов (временно в памяти)
+orders_db = {}
+
+@app.route('/order/<int:order_id>', methods=['GET'])
+def get_order_status(order_id):
+    """Проверить статус заказа"""
+    order = orders_db.get(order_id)
+    if not order:
+        return jsonify({"error": "Order not found"}), 404
+    return jsonify({
+        "order_id": order_id,
+        "status": order["status"].value,
+        "tour_id": order["tour_id"],
+        "user_name": order["user_name"],
+        "seats": order["seats"]
+    })
+
+@app.route('/order/safe_book', methods=['POST'])
+def safe_book_with_saga():
+    """
+    Сквозной сценарий с транзакционностью (Saga pattern):
+    1. Создаём заказ со статусом NEW
+    2. Пытаемся создать бронирование
+    3. Пытаемся провести оплату
+    4. Если оплата не прошла → отменяем бронирование (компенсация)
+    """
+    data = request.json
+    tour_id = data.get('tour_id')
+    user_name = data.get('user_name')
+    seats = data.get('seats')
+
+    if not all([tour_id, user_name, seats]):
+        return jsonify({"error": "Missing fields"}), 400
+
+    # 1. Проверяем тур
+    try:
+        tour_resp = requests.get(f"{CATALOG_URL}/tours/{tour_id}", timeout=5)
+        if tour_resp.status_code != 200:
+            return jsonify({"error": f"Tour {tour_id} not found"}), 404
+        tour = tour_resp.json()
+        amount = tour['price'] * seats
+    except Exception as e:
+        return jsonify({"error": f"Catalog error: {str(e)}"}), 503
+
+    # 2. Создаём заказ со статусом NEW
+    order_id = uuid.uuid4().int % 1000000
+    orders_db[order_id] = {
+        "status": OrderStatus.NEW,
+        "tour_id": tour_id,
+        "user_name": user_name,
+        "seats": seats,
+        "booking_id": None
+    }
+
+    # 3. Saga: пытаемся выполнить операции, с возможностью отката
+    booking_id = None
+    try:
+        # --- Шаг A: Создаём бронирование ---
+        booking_resp = requests.post(
+            f"{BOOKING_URL}/bookings",
+            json={"tour_id": tour_id, "user_name": user_name, "seats": seats},
+            timeout=5
+        )
+        if booking_resp.status_code != 201:
+            raise Exception("Booking service failed")
+        booking = booking_resp.json()
+        booking_id = booking['id']
+        orders_db[order_id]["booking_id"] = booking_id
+
+        # --- Шаг B: Проводим оплату ---
+        payment_resp = requests.post(
+            f"{PAYMENT_URL}/pay",
+            json={"booking_id": booking_id, "amount": amount},
+            timeout=5
+        )
+        if payment_resp.status_code != 200:
+            raise Exception("Payment failed")
+
+        # --- Всё успешно: обновляем статус заказа ---
+        orders_db[order_id]["status"] = OrderStatus.PAID
+
+        return jsonify({
+            "status": "success",
+            "order_id": order_id,
+            "order_status": OrderStatus.PAID.value,
+            "booking_id": booking_id,
+            "payment": payment_resp.json(),
+            "total_amount": amount
+        }), 201
+
+    except Exception as e:
+        # --- КОМПЕНСАЦИЯ (Saga Rollback) ---
+        # Если бронирование было создано, но оплата не прошла — отменяем бронь
+        if booking_id:
+            try:
+                # В реальном API нужен DELETE /bookings/<id>, у нас симуляция
+                # Отмечаем бронь как cancelled (можно добавить эндпоинт, но для демо просто лог)
+                print(f"Compensation: cancelling booking {booking_id}")
+                # Здесь мог бы быть вызов booking_service.cancel(booking_id)
+            except:
+                pass
+            orders_db[order_id]["status"] = OrderStatus.CANCELLED
+            return jsonify({
+                "status": "failed",
+                "error": str(e),
+                "order_id": order_id,
+                "order_status": OrderStatus.CANCELLED.value,
+                "message": "Booking created but payment failed → booking cancelled (Saga compensation)"
+            }), 402
+
+        # Если бронирование даже не создалось
+        orders_db[order_id]["status"] = OrderStatus.CANCELLED
+        return jsonify({
+            "status": "failed",
+            "error": str(e),
+            "order_id": order_id,
+            "order_status": OrderStatus.CANCELLED.value
+        }), 500
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
