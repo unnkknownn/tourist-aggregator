@@ -1,0 +1,86 @@
+name: CI/CD for Tourist Aggregator
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Установка Python для тестов каталога и платежей
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # Установка Node.js для тестов бронирований
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    # Проверка синтаксиса Python (линтинг)
+    - name: Install Python linters
+      run: |
+        pip install flake8 pylint
+        pip install -r catalog-service/requirements.txt
+        pip install -r payment-service/requirements.txt
+
+    - name: Lint Python code
+      run: |
+        flake8 catalog-service/*.py --max-line-length=120
+        flake8 payment-service/*.py --max-line-length=120
+
+    # Проверка синтаксиса Node.js
+    - name: Install Node linters
+      run: |
+        cd booking-service
+        npm install -g eslint
+        npm install
+
+    - name: Lint Node.js code
+      run: |
+        cd booking-service
+        npx eslint app.js
+
+    # Запуск тестов (если есть)
+    - name: Run Python tests
+      run: |
+        echo "No tests yet, skipping..."
+        # python -m pytest catalog-service/tests/
+
+    - name: Run Node.js tests
+      run: |
+        cd booking-service
+        echo "No tests yet, skipping..."
+        # npm test
+
+    # Сборка Docker-образов
+    - name: Build Docker images
+      run: |
+        docker-compose build
+
+    # Запуск Docker Compose и проверка, что сервисы стартуют
+    - name: Start services with Docker Compose
+      run: |
+        docker-compose up -d
+        sleep 10
+
+    - name: Check services health
+      run: |
+        curl --fail http://localhost:5001/tours || exit 1
+        curl --fail http://localhost:5002/bookings || exit 1
+        curl -X POST http://localhost:5003/pay \
+          -H "Content-Type: application/json" \
+          -d '{"booking_id":1,"amount":100}' || exit 1
+
+    - name: Stop services
+      run: |
+        docker-compose down
