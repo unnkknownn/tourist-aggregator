@@ -20,6 +20,20 @@ services:
     networks:
       - tourist-net
 
+ # НОВЫЙ СЕРВИС - ОРКЕСТРАТОР
+  integration-service:
+    build: ./integration-service
+    ports:
+      - "5000:5000"
+    networks:
+      - tourist-net
+    depends_on:
+      - catalog-service
+      - booking-service
+      - payment-service
+
 networks:
   tourist-net:
     driver: bridge
+
+    
